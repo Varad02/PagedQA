@@ -1,0 +1,4 @@
+vllm>=0.4.0
+gradio>=4.0.0
+pdfplumber>=0.10.0
+plotly>=5.0.0
