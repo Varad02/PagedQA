@@ -36,10 +36,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class EngineConfig:
-    # Change in EngineConfig
-    model: str = "Qwen/Qwen2.5-1.5B-Instruct"
-    quantization: str = "awq"
-    gpu_memory_utilization: float = 0.85
+    model: str = "meta-llama/Llama-3.1-8B-Instruct"
 
     # Prefix caching — this is the whole point of the project
     enable_prefix_caching: bool = True
@@ -256,9 +253,13 @@ async def shutdown() -> None:
     Gracefully shut down the engine.
     Call this when the server is stopping to free GPU memory cleanly.
     """
-    global _engine
+    global _engine, _config
     if _engine is not None:
         logger.info("Shutting down vLLM engine...")
-        await _engine.abort_all()
+        try:
+            _engine.engine.shutdown()
+        except Exception as e:
+            logger.warning("Engine shutdown warning (non-fatal): %s", e)
         _engine = None
+        _config = None
         logger.info("vLLM engine shut down.")

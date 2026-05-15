@@ -1,325 +1,265 @@
 """
-app.py — PagedQA
-Gradio UI with four tabs:
-    1. Upload   — ingest a PDF or .txt file, get a doc_id
-    2. Ask      — stream answers against an uploaded document
-    3. Benchmark — cold vs warm benchmark with Plotly charts
-    4. Memory   — live KV block memory visualization
+engine.py — PagedQA
+vLLM AsyncLLMEngine wrapper.
 
-Run:
-    python app.py
+Responsibilities:
+  - Lazy singleton initialization of the engine with prefix caching enabled
+  - stream_generate(): async generator that yields token deltas
+  - get_stats(): pulls block memory stats for the live dashboard
+
+Design notes:
+  - The engine is initialized once on the first real request (lazy singleton).
+    This keeps the Gradio UI responsive at startup while the model loads.
+  - stream_generate() tracks previous output length and yields only the new
+    characters each iteration — Gradio's streaming expects deltas, not
+    cumulative text.
+  - get_stats() reaches into vLLM's scheduler block manager. This is an
+    internal API but stable across recent vLLM versions (0.4.x+).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import time
+from dataclasses import dataclass, field
+from typing import AsyncGenerator, Optional
 
-import gradio as gr
+from vllm import AsyncLLMEngine, AsyncEngineArgs, SamplingParams
+from vllm.utils import random_uuid
 
-import document
-import engine
-import benchmark
-import charts
-from engine import EngineConfig
-
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Tab 1 — Upload
+# Configuration
 # ---------------------------------------------------------------------------
 
-def handle_upload(file) -> tuple[str, str, str]:
-    """
-    Ingest the uploaded file and return:
-        (doc_id, info string, text preview)
-    """
-    if file is None:
-        return "", "No file uploaded.", ""
+@dataclass
+class EngineConfig:
+    model: str = "meta-llama/Llama-3.1-8B-Instruct"
 
-    try:
-        doc = document.ingest(file.name, file.name.split("/")[-1])
-    except ValueError as e:
-        return "", f"❌ {e}", ""
+    # Prefix caching — this is the whole point of the project
+    enable_prefix_caching: bool = True
 
-    info = (
-        f"✅ Uploaded successfully\n"
-        f"doc_id     : {doc.doc_id}\n"
-        f"Pages      : {doc.page_count or 'N/A (plain text)'}\n"
-        f"Characters : {doc.char_count:,}\n"
-        f"Truncated  : {'Yes' if doc.truncated else 'No'}"
-    )
-    preview = doc.text[:1000] + ("\n\n[... truncated for preview]" if doc.char_count > 1000 else "")
-    return doc.doc_id, info, preview
+    # Fraction of GPU memory reserved for the KV cache.
+    # 0.90 leaves ~10% headroom for activations and other overhead.
+    gpu_memory_utilization: float = 0.90
 
+    # Generation parameters
+    max_new_tokens: int = 512
+    temperature: float = 0.1        # low temp for factual Q&A
+    top_p: float = 0.95
 
-def build_upload_tab() -> None:
-    gr.Markdown("### Upload a document\nSupports PDF and plain text (.txt, .md).")
-
-    with gr.Row():
-        file_input = gr.File(label="Upload PDF or .txt", file_types=[".pdf", ".txt", ".md"])
-
-    with gr.Row():
-        doc_id_out = gr.Textbox(label="doc_id (copy this for the Ask and Benchmark tabs)", interactive=False)
-
-    with gr.Row():
-        info_out    = gr.Textbox(label="Upload info", lines=6,  interactive=False)
-        preview_out = gr.Textbox(label="Text preview", lines=6, interactive=False)
-
-    file_input.change(
-        fn=handle_upload,
-        inputs=[file_input],
-        outputs=[doc_id_out, info_out, preview_out],
-    )
+    # Tensor parallelism — set to number of GPUs available.
+    # 1 for a single-GPU RunPod instance.
+    tensor_parallel_size: int = 1
 
 
 # ---------------------------------------------------------------------------
-# Tab 2 — Ask
+# Singleton
 # ---------------------------------------------------------------------------
 
-async def handle_ask(doc_id: str, question: str):
+_engine: Optional[AsyncLLMEngine] = None
+_config: Optional[EngineConfig] = None
+_init_lock = asyncio.Lock()
+
+
+async def get_engine(config: Optional[EngineConfig] = None) -> AsyncLLMEngine:
     """
-    Async generator — yields (answer_so_far, latency_string) tuples
-    so Gradio can stream the answer token by token.
+    Return the running engine, initializing it on first call.
+
+    Args:
+        config: EngineConfig to use on first init. Ignored on subsequent calls.
+                If None, uses default EngineConfig().
+
+    Returns:
+        The initialized AsyncLLMEngine singleton.
     """
-    if not doc_id.strip():
-        yield "Please enter a doc_id from the Upload tab.", ""
-        return
-    if not question.strip():
-        yield "Please enter a question.", ""
-        return
+    global _engine, _config
 
-    try:
-        prompt = document.build_prompt(doc_id.strip(), question.strip())
-    except KeyError as e:
-        yield str(e), ""
-        return
+    if _engine is not None:
+        return _engine
 
-    answer = ""
-    start  = time.perf_counter()
+    async with _init_lock:
+        # Double-checked locking — another coroutine may have initialized
+        # while we were waiting for the lock.
+        if _engine is not None:
+            return _engine
 
-    async for delta in engine.stream_generate(prompt):
-        answer += delta
-        elapsed = time.perf_counter() - start
-        yield answer, f"{elapsed:.2f}s"
+        cfg = config or EngineConfig()
+        _config = cfg
 
-
-def build_ask_tab() -> None:
-    gr.Markdown("### Ask a question\nPaste the doc_id from the Upload tab.")
-
-    with gr.Row():
-        doc_id_in   = gr.Textbox(label="doc_id", placeholder="Paste doc_id here...")
-        question_in = gr.Textbox(label="Question", placeholder="What is this document about?", lines=2)
-
-    ask_btn = gr.Button("Ask ▶", variant="primary")
-
-    with gr.Row():
-        answer_out  = gr.Textbox(label="Answer", lines=10, interactive=False)
-        latency_out = gr.Textbox(label="Latency", interactive=False, scale=0, min_width=100)
-
-    ask_btn.click(
-        fn=handle_ask,
-        inputs=[doc_id_in, question_in],
-        outputs=[answer_out, latency_out],
-    )
-
-
-# ---------------------------------------------------------------------------
-# Tab 3 — Benchmark
-# ---------------------------------------------------------------------------
-
-async def handle_benchmark(doc_id: str, num_questions: int, concurrency: int):
-    """
-    Run the full cold vs warm benchmark and return three Plotly figures
-    plus a summary text.
-    """
-    if not doc_id.strip():
-        empty = charts._base_layout()
-        yield "Please enter a doc_id.", None, None, None
-        return
-
-    yield "⏳ Running benchmark — this takes a few minutes...", None, None, None
-
-    try:
-        result = await benchmark.run(
-            doc_id=doc_id.strip(),
-            num_questions=int(num_questions),
-            concurrency=int(concurrency),
+        logger.info(
+            "Initializing vLLM engine | model=%s | prefix_caching=%s | "
+            "gpu_mem_util=%.2f",
+            cfg.model,
+            cfg.enable_prefix_caching,
+            cfg.gpu_memory_utilization,
         )
+
+        engine_args = AsyncEngineArgs(
+            model=cfg.model,
+            enable_prefix_caching=cfg.enable_prefix_caching,
+            gpu_memory_utilization=cfg.gpu_memory_utilization,
+            tensor_parallel_size=cfg.tensor_parallel_size,
+            # Disable the usage stats ping — cleaner logs in demos
+            disable_log_stats=False,
+        )
+
+        _engine = AsyncLLMEngine.from_engine_args(engine_args)
+        logger.info("vLLM engine ready.")
+
+    return _engine
+
+
+# ---------------------------------------------------------------------------
+# Streaming generation
+# ---------------------------------------------------------------------------
+
+async def stream_generate(
+    prompt: str,
+    config: Optional[EngineConfig] = None,
+) -> AsyncGenerator[str, None]:
+    """
+    Stream token deltas for a given prompt.
+
+    Yields new text only (not cumulative output) so callers can simply
+    concatenate what they receive.
+
+    Args:
+        prompt: The full prompt string (system + document + question).
+        config: Optional EngineConfig. Uses module default if None.
+
+    Yields:
+        str — new characters generated since the last yield.
+
+    Example:
+        async for delta in stream_generate(prompt):
+            print(delta, end="", flush=True)
+    """
+    cfg = config or _config or EngineConfig()
+    engine = await get_engine(cfg)
+
+    sampling_params = SamplingParams(
+        temperature=cfg.temperature,
+        top_p=cfg.top_p,
+        max_tokens=cfg.max_new_tokens,
+    )
+
+    request_id = random_uuid()
+    previous_length = 0
+
+    async for output in engine.generate(prompt, sampling_params, request_id):
+        # output.outputs is a list; we always take the first (single) sequence
+        if not output.outputs:
+            continue
+
+        current_text = output.outputs[0].text
+        delta = current_text[previous_length:]
+        previous_length = len(current_text)
+
+        if delta:
+            yield delta
+
+        # Stop early if the sequence is finished
+        if output.outputs[0].finish_reason is not None:
+            break
+
+
+# ---------------------------------------------------------------------------
+# Stats
+# ---------------------------------------------------------------------------
+
+def get_stats() -> dict:
+    """
+    Return current block memory stats from the vLLM scheduler.
+
+    Reaches into the engine's internal block manager — internal API,
+    but stable across vLLM 0.4.x+.
+
+    Returns a dict with:
+        total_blocks    — total physical KV cache blocks on GPU
+        used_blocks     — blocks currently allocated to active requests
+        free_blocks     — blocks available for new requests
+        utilization_pct — used / total * 100
+        cache_hit_rate  — prefix cache hit rate since engine start (0.0–1.0)
+        prefix_caching  — whether prefix caching is enabled
+        model           — model name
+        ready           — False if engine not yet initialized
+
+    If the engine is not initialized yet, returns a zeroed-out dict with
+    ready=False so the dashboard can show a "waiting" state gracefully.
+    """
+    if _engine is None:
+        return {
+            "ready": False,
+            "total_blocks": 0,
+            "used_blocks": 0,
+            "free_blocks": 0,
+            "utilization_pct": 0.0,
+            "cache_hit_rate": 0.0,
+            "prefix_caching": False,
+            "model": "",
+        }
+
+    try:
+        # Navigate into the scheduler's block manager
+        scheduler = _engine.engine.scheduler
+        block_manager = scheduler.block_manager
+
+        total = block_manager.get_num_total_gpu_blocks()
+        free = block_manager.get_num_free_gpu_blocks()
+        used = total - free
+
+        # Cache hit rate — available when prefix caching is on
+        hit_rate = 0.0
+        try:
+            stats = _engine.engine.stat_logger.stats
+            hit_rate = getattr(stats, "gpu_prefix_cache_hit_rate", 0.0) or 0.0
+        except Exception:
+            pass
+
+        return {
+            "ready": True,
+            "total_blocks": total,
+            "used_blocks": used,
+            "free_blocks": free,
+            "utilization_pct": round((used / total * 100) if total > 0 else 0.0, 1),
+            "cache_hit_rate": round(float(hit_rate), 3),
+            "prefix_caching": _config.enable_prefix_caching if _config else False,
+            "model": _config.model if _config else "",
+        }
+
     except Exception as e:
-        yield f"❌ Benchmark failed: {e}", None, None, None
-        return
-
-    result_dict = result.to_dict()
-    summary     = result_dict["summary"]
-
-    summary_text = (
-        f"✅ Benchmark complete\n\n"
-        f"Cold  median latency : {summary['cold_median_latency']:.3f}s\n"
-        f"Warm  median latency : {summary['warm_median_latency']:.3f}s\n"
-        f"Speedup              : {summary['speedup']}×\n\n"
-        f"Cold  median TTFT    : {summary['cold_median_ttft']:.3f}s\n"
-        f"Warm  median TTFT    : {summary['warm_median_ttft']:.3f}s\n\n"
-        f"Cold  median tps     : {summary['cold_median_tps']:.1f}\n"
-        f"Warm  median tps     : {summary['warm_median_tps']:.1f}\n\n"
-        f"Cache hit rate       : {result_dict['cache_hit_rate'] * 100:.1f}%\n"
-        f"Concurrency          : {result_dict['concurrency']}"
-    )
-
-    fig_latency, fig_throughput, fig_cache = charts.all_charts(result_dict)
-    yield summary_text, fig_latency, fig_throughput, fig_cache
-
-
-def build_benchmark_tab() -> None:
-    gr.Markdown(
-        "### Benchmark prefix caching\n"
-        "Runs cold (no cache) and warm (cached) conditions concurrently "
-        "and plots the difference."
-    )
-
-    with gr.Row():
-        doc_id_in      = gr.Textbox(label="doc_id", placeholder="Paste doc_id here...")
-        num_q_slider   = gr.Slider(minimum=5, maximum=20, value=10, step=1,  label="Number of questions")
-        conc_slider    = gr.Slider(minimum=1, maximum=20, value=10, step=1,  label="Concurrency")
-
-    run_btn     = gr.Button("Run benchmark ▶", variant="primary")
-    summary_out = gr.Textbox(label="Summary", lines=14, interactive=False)
-
-    with gr.Row():
-        latency_plot    = gr.Plot(label="Latency: cold vs warm")
-        throughput_plot = gr.Plot(label="Throughput: tokens / second")
-
-    cache_plot = gr.Plot(label="Cache hit rate over requests")
-
-    run_btn.click(
-        fn=handle_benchmark,
-        inputs=[doc_id_in, num_q_slider, conc_slider],
-        outputs=[summary_out, latency_plot, throughput_plot, cache_plot],
-    )
+        logger.warning("Could not read block stats: %s", e)
+        return {
+            "ready": True,
+            "total_blocks": 0,
+            "used_blocks": 0,
+            "free_blocks": 0,
+            "utilization_pct": 0.0,
+            "cache_hit_rate": 0.0,
+            "prefix_caching": False,
+            "model": _config.model if _config else "",
+        }
 
 
 # ---------------------------------------------------------------------------
-# Tab 4 — Memory
+# Teardown
 # ---------------------------------------------------------------------------
 
-def _render_block_grid(stats: dict) -> str:
+async def shutdown() -> None:
     """
-    Render a simple HTML block grid showing GPU KV cache state.
-    Each square represents one physical block:
-        gray  — free
-        teal  — occupied
-        amber — shared / prefix-cached
+    Gracefully shut down the engine.
+    Call this when the server is stopping to free GPU memory cleanly.
     """
-    if not stats.get("ready"):
-        return "<p style='color: var(--body-text-color); padding: 1rem;'>⏳ Engine not initialized yet. Send a query first.</p>"
-
-    total = stats["total_blocks"]
-    used  = stats["used_blocks"]
-    free  = stats["free_blocks"]
-
-    if total == 0:
-        return "<p style='padding:1rem'>No block data available.</p>"
-
-    # Estimate cached blocks from cache_hit_rate
-    hit_rate      = stats.get("cache_hit_rate", 0.0)
-    cached_blocks = int(used * hit_rate)
-    plain_used    = used - cached_blocks
-
-    cells = []
-    for i in range(total):
-        if i < cached_blocks:
-            color   = "#1D9E75"   # teal — cached prefix blocks
-            title   = "Cached (shared prefix)"
-        elif i < used:
-            color   = "#E8593C"   # coral — occupied
-            title   = "Occupied"
-        else:
-            color   = "#D3D1C7"   # gray — free
-            title   = "Free"
-
-        cells.append(
-            f'<div title="{title}" style="'
-            f'width:12px;height:12px;border-radius:2px;'
-            f'background:{color};display:inline-block;margin:1px;">'
-            f'</div>'
-        )
-
-    grid_html = "".join(cells)
-
-    legend = (
-        '<div style="margin-top:12px;font-size:13px;display:flex;gap:16px;">'
-        f'<span><span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:#1D9E75;margin-right:4px;vertical-align:middle;"></span>Cached prefix ({cached_blocks})</span>'
-        f'<span><span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:#E8593C;margin-right:4px;vertical-align:middle;"></span>Occupied ({plain_used})</span>'
-        f'<span><span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:#D3D1C7;margin-right:4px;vertical-align:middle;"></span>Free ({free})</span>'
-        '</div>'
-    )
-
-    stats_line = (
-        f'<div style="margin-bottom:8px;font-size:13px;">'
-        f'<b>GPU KV cache blocks</b> — '
-        f'Total: {total} &nbsp;|&nbsp; '
-        f'Used: {used} ({stats["utilization_pct"]}%) &nbsp;|&nbsp; '
-        f'Cache hit rate: {stats["cache_hit_rate"]*100:.1f}%'
-        f'</div>'
-    )
-
-    return f'<div style="padding:1rem;">{stats_line}{grid_html}{legend}</div>'
-
-
-def handle_memory_poll() -> str:
-    stats = engine.get_stats()
-    return _render_block_grid(stats)
-
-
-def build_memory_tab() -> None:
-    gr.Markdown(
-        "### Live KV block memory\n"
-        "Polls vLLM's block manager every 2 seconds. "
-        "Send queries or run the benchmark to see blocks fill up."
-    )
-
-    memory_html = gr.HTML(value=handle_memory_poll())
-
-    # Poll every 2 seconds using gr.Timer
-    timer = gr.Timer(value=2)
-    timer.tick(fn=handle_memory_poll, outputs=[memory_html])
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def build_app() -> gr.Blocks:
-    with gr.Blocks(title="PagedQA", theme=gr.themes.Soft()) as demo:
-        gr.Markdown(
-            "# PagedQA\n"
-            "Document Q&A powered by [vLLM](https://github.com/vllm-project/vllm) "
-            "with prefix caching. Upload a document, ask questions, and benchmark "
-            "the speedup from KV cache reuse."
-        )
-
-        with gr.Tab("📄 Upload"):
-            build_upload_tab()
-
-        with gr.Tab("💬 Ask"):
-            build_ask_tab()
-
-        with gr.Tab("📊 Benchmark"):
-            build_benchmark_tab()
-
-        with gr.Tab("🧠 Memory"):
-            build_memory_tab()
-
-    return demo
-
-
-if __name__ == "__main__":
-    app = build_app()
-    app.launch(
-        server_name="0.0.0.0",   # accessible from outside (needed on RunPod / Colab)
-        server_port=7860,
-        share=True,              # generates a public gradio.live link
-    )
+    global _engine, _config
+    if _engine is not None:
+        logger.info("Shutting down vLLM engine...")
+        try:
+            _engine.engine.shutdown()
+        except Exception as e:
+            logger.warning("Engine shutdown warning (non-fatal): %s", e)
+        _engine = None
+        _config = None
+        logger.info("vLLM engine shut down.")
