@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class EngineConfig:
-    model: str = "meta-llama/Llama-3.1-8B-Instruct"
+    model: str = "Qwen/Qwen2.5-1.5B-Instruct"
 
     # Prefix caching — this is the whole point of the project
     enable_prefix_caching: bool = True

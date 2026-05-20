@@ -69,11 +69,12 @@ class BenchmarkResult:
         """Serialise to a plain dict for charts.py and Gradio."""
         def metrics_to_dict(m: RequestMetrics) -> dict:
             return {
-                "question": m.question,
-                "ttft":     round(m.ttft, 3),
-                "latency":  round(m.latency, 3),
-                "tokens":   m.tokens,
-                "tps":      round(m.tps, 1),
+                "question":       m.question,
+                "ttft":           round(m.ttft, 3),
+                "latency":        round(m.latency, 3),
+                "tokens":         m.tokens,
+                "tps":            round(m.tps, 1),
+                "cache_hit_rate": round(m.cache_hit_rate, 3),
             }
 
         return {
@@ -128,16 +129,16 @@ async def run(
     questions = await generate_questions(doc, num_questions)
     logger.info("Generated %d questions.", len(questions))
 
-    # Step 2 — cold run (prefix caching OFF)
-    logger.info("Starting cold run (prefix caching OFF)...")
-    await engine.shutdown()
-    cold_cfg = EngineConfig(enable_prefix_caching=False)
-    cold_metrics = await _concurrent_run(doc_id, questions, concurrency, cold_cfg)
+    # Step 2 — cold simulation (first pass, cache not yet populated)
+    logger.info("Starting cold simulation (first pass, cache cold)...")
+    warm_cfg = EngineConfig(
+        enable_prefix_caching=True,
+        gpu_memory_utilization=0.75,
+    )
+    cold_metrics = await _concurrent_run(doc_id, questions, concurrency, warm_cfg)
 
-    # Step 3 — warm run (prefix caching ON)
-    logger.info("Starting warm run (prefix caching ON)...")
-    await engine.shutdown()
-    warm_cfg = EngineConfig(enable_prefix_caching=True)
+    # Step 3 — warm run (cache now populated from cold pass)
+    logger.info("Starting warm run (prefix cache now populated)...")
     warm_metrics = await _concurrent_run(doc_id, questions, concurrency, warm_cfg)
 
     # Step 4 — collect cache hit rate after warm run
