@@ -200,7 +200,11 @@ def build_prompt(doc_id: str, question: str) -> str:
     if doc is None:
         raise KeyError(f"Document '{doc_id}' not found. Please upload it first.")
 
-    return doc.prefix + f"<|user|>\n{question.strip()}\n<|assistant|>\n"
+    return (
+        doc.prefix
+        + f"<|im_start|>user\n{question.strip()}<|im_end|>\n"
+        + f"<|im_start|>assistant\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -213,11 +217,12 @@ def _build_prefix(document_text: str) -> str:
     This is called once per document and cached on the Document object.
     """
     return (
-        f"<|system|>\n"
+        f"<|im_start|>system\n"
         f"{SYSTEM_MESSAGE}\n\n"
         f"--- DOCUMENT ---\n"
         f"{document_text.strip()}\n"
         f"--- END DOCUMENT ---\n"
+        f"<|im_end|>\n"
     )
 
 

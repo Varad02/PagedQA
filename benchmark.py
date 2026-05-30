@@ -170,9 +170,9 @@ async def generate_questions(
     parse reliably.
     """
     prompt = (
-        f"<|system|>\n"
-        f"You are a helpful assistant that generates questions.\n"
-        f"<|user|>\n"
+        f"<|im_start|>system\n"
+        f"You are a helpful assistant that generates questions.<|im_end|>\n"
+        f"<|im_start|>user\n"
         f"Read the document below and generate exactly {n} diverse questions "
         f"that can be answered from its content.\n\n"
         f"Rules:\n"
@@ -181,8 +181,8 @@ async def generate_questions(
         f"- No preamble, no explanation, no blank lines between questions.\n\n"
         f"--- DOCUMENT ---\n"
         f"{doc.text.strip()}\n"
-        f"--- END DOCUMENT ---\n"
-        f"<|assistant|>\n"
+        f"--- END DOCUMENT ---<|im_end|>\n"
+        f"<|im_start|>assistant\n"
     )
 
     # Collect full response (no streaming needed here)
@@ -227,9 +227,9 @@ async def _concurrent_run(
         prompt = document.build_prompt(doc_id, question)
         first_token_time: Optional[float] = None
         token_count = 0
-        start = time.perf_counter()
 
         async with sem:
+            start = time.perf_counter()   # start after acquiring the semaphore
             async for delta in engine.stream_generate(prompt, config=cfg):
                 if first_token_time is None:
                     first_token_time = time.perf_counter()

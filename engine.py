@@ -45,14 +45,17 @@ class EngineConfig:
     # 0.90 leaves ~10% headroom for activations and other overhead.
     gpu_memory_utilization: float = 0.90
 
-    # Generation parameters
-    max_new_tokens: int = 512
+    # Generation parameters — None means generate until stop token or context limit
+    max_new_tokens: Optional[int] = None
     temperature: float = 0.1        # low temp for factual Q&A
     top_p: float = 0.95
 
     # Tensor parallelism — set to number of GPUs available.
     # 1 for a single-GPU RunPod instance.
     tensor_parallel_size: int = 1
+
+    # T4 (compute capability 7.5) does not support bfloat16; use float16.
+    dtype: str = "float16"
 
 
 # ---------------------------------------------------------------------------
@@ -102,12 +105,13 @@ async def get_engine(config: Optional[EngineConfig] = None) -> AsyncLLMEngine:
             enable_prefix_caching=cfg.enable_prefix_caching,
             gpu_memory_utilization=cfg.gpu_memory_utilization,
             tensor_parallel_size=cfg.tensor_parallel_size,
-            # Disable the usage stats ping — cleaner logs in demos
+            dtype=cfg.dtype,
             disable_log_stats=False,
         )
 
         _engine = AsyncLLMEngine.from_engine_args(engine_args)
         logger.info("vLLM engine ready.")
+
 
     return _engine
 
@@ -143,7 +147,8 @@ async def stream_generate(
     sampling_params = SamplingParams(
         temperature=cfg.temperature,
         top_p=cfg.top_p,
-        max_tokens=cfg.max_new_tokens,
+        max_tokens=cfg.max_new_tokens or 2048,
+        stop=["<|im_end|>", "<|endoftext|>"],
     )
 
     request_id = random_uuid()
@@ -203,22 +208,31 @@ def get_stats() -> dict:
         }
 
     try:
-        # Navigate into the scheduler's block manager
-        scheduler = _engine.engine.scheduler
+        # vLLM 0.7+: AsyncLLMEngine -> _AsyncLLMEngine -> LLMEngine (double unwrap)
+        llm_engine = _engine.engine
+        if hasattr(llm_engine, "engine"):
+            llm_engine = llm_engine.engine
+
+        scheduler = llm_engine.scheduler
+        if isinstance(scheduler, list):
+            scheduler = scheduler[0]
+
         block_manager = scheduler.block_manager
+        total = block_manager.num_total_gpu_blocks          # attribute in 0.7+
+        free  = block_manager.get_num_free_gpu_blocks()
+        used  = total - free
 
-        total = block_manager.get_num_total_gpu_blocks()
-        free = block_manager.get_num_free_gpu_blocks()
-        used = total - free
-
-        # Cache hit rate — available when prefix caching is on
-        hit_rate = 0.0
         try:
-            stats = _engine.engine.stat_logger.stats
-            hit_rate = getattr(stats, "gpu_prefix_cache_hit_rate", 0.0) or 0.0
+            from vllm.utils import Device
+            hit_rate = float(block_manager.get_prefix_cache_hit_rate(Device.GPU))
         except Exception:
-            pass
+            try:
+                hit_rate = float(block_manager.get_prefix_cache_hit_rate())
+            except Exception as e:
+                logger.warning("get_prefix_cache_hit_rate() failed: %s", e)
+                hit_rate = 0.0
 
+        logger.info("block stats: total=%d used=%d hit_rate=%.4f", total, used, hit_rate)
         return {
             "ready": True,
             "total_blocks": total,
