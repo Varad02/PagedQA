@@ -21,7 +21,7 @@ from plotly.subplots import make_subplots
 
 COLD_COLOR  = "#E8593C"   # coral — cold run (no caching)
 WARM_COLOR  = "#1D9E75"   # teal  — warm run (with caching)
-GRID_COLOR  = "rgba(0,0,0,0.06)"
+GRID_COLOR  = "rgba(0,0,0,0.05)"
 FONT_FAMILY = "Inter, system-ui, sans-serif"
 
 
@@ -60,18 +60,20 @@ def latency_chart(result: dict) -> go.Figure:
         name="Cold (no cache)",
         x=categories,
         y=cold_values,
-        marker_color=COLD_COLOR,
+        marker=dict(color=COLD_COLOR, line=dict(width=0)),
         text=[f"{v:.2f}s" for v in cold_values],
         textposition="outside",
+        hovertemplate="%{x}: %{y:.3f}s<extra>Cold</extra>",
     ))
 
     fig.add_trace(go.Bar(
         name="Warm (prefix cached)",
         x=categories,
         y=warm_values,
-        marker_color=WARM_COLOR,
+        marker=dict(color=WARM_COLOR, line=dict(width=0)),
         text=[f"{v:.2f}s" for v in warm_values],
         textposition="outside",
+        hovertemplate="%{x}: %{y:.3f}s<extra>Warm</extra>",
     ))
 
     speedup = result["summary"]["speedup"]
@@ -110,16 +112,16 @@ def throughput_chart(result: dict) -> go.Figure:
         name="Cold (no cache)",
         x=request_labels,
         y=cold_tps,
-        marker_color=COLD_COLOR,
-        opacity=0.85,
+        marker=dict(color=COLD_COLOR, opacity=0.85, line=dict(width=0)),
+        hovertemplate="%{x}: %{y:.1f} tok/s<extra>Cold</extra>",
     ))
 
     fig.add_trace(go.Bar(
         name="Warm (prefix cached)",
         x=request_labels,
         y=warm_tps,
-        marker_color=WARM_COLOR,
-        opacity=0.85,
+        marker=dict(color=WARM_COLOR, opacity=0.85, line=dict(width=0)),
+        hovertemplate="%{x}: %{y:.1f} tok/s<extra>Warm</extra>",
     ))
 
     # Median reference lines
@@ -220,11 +222,15 @@ def all_charts(result: dict) -> tuple[go.Figure, go.Figure, go.Figure]:
 def _base_layout() -> dict:
     """Shared Plotly layout applied to every chart."""
     return dict(
-        font=dict(family=FONT_FAMILY, size=13),
+        font=dict(family=FONT_FAMILY, size=13, color="#334155"),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        margin=dict(t=60, b=40, l=60, r=20),
-        hoverlabel=dict(font_size=13),
+        margin=dict(t=70, b=44, l=64, r=24),
+        hoverlabel=dict(
+            font_size=13,
+            bgcolor="white",
+            bordercolor="#e2e8f0",
+        ),
     )
 
 
